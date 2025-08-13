@@ -348,6 +348,11 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 	}
 	opts.HideThinking = hidethinking
 
+	forceInteractive, err := cmd.Flags().GetBool("interactive")
+	if err != nil {
+		return err
+	}
+
 	keepAlive, err := cmd.Flags().GetString("keepalive")
 	if err != nil {
 		return err
@@ -361,20 +366,40 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 	}
 
 	prompts := args[1:]
-	// prepend stdin to the prompt if provided
+	var pipeInput string
+	var hasPipeInput bool
+	
+	// Check if stdin is piped and read it
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
 		in, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}
-
-		prompts = append([]string{string(in)}, prompts...)
+		pipeInput = strings.TrimSpace(string(in))
+		hasPipeInput = true
 		opts.WordWrap = false
-		interactive = false
 	}
-	opts.Prompt = strings.Join(prompts, " ")
-	if len(prompts) > 0 {
-		interactive = false
+	
+	// Handle input based on flags and prompts
+	if hasPipeInput {
+		if forceInteractive {
+			// User wants interactive mode after pipe - just set the prompt
+			opts.Prompt = pipeInput
+			// Keep interactive = true, but we'll process the pipe first
+		} else {
+			// Original behavior: combine pipe with any command line prompts and exit
+			if pipeInput != "" {
+				prompts = append([]string{pipeInput}, prompts...)
+			}
+			opts.Prompt = strings.Join(prompts, " ")
+			interactive = false
+		}
+	} else {
+		// No piped input
+		opts.Prompt = strings.Join(prompts, " ")
+		if len(prompts) > 0 {
+			interactive = false
+		}
 	}
 	// Be quiet if we're redirecting to a pipe or file
 	if !term.IsTerminal(int(os.Stdout.Fd())) {
@@ -433,6 +458,7 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 
 	opts.ParentModel = info.Details.ParentModel
 
+	// Handle interactive mode (including pipe-then-interactive with -i flag)
 	if interactive {
 		if err := loadOrUnloadModel(cmd, &opts); err != nil {
 			return err
@@ -450,9 +476,40 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 			}
 		}
 
+		// If we have piped input with -i flag, process it first then go interactive
+		if hasPipeInput && forceInteractive && opts.Prompt != "" {
+			if err := generate(cmd, opts); err != nil {
+				return err
+			}
+			
+			// Reset prompt for interactive mode and reopen stdin
+			opts.Prompt = ""
+			
+			// Reopen stdin to /dev/tty for interactive input after piping
+			if err := reopenStdinToTTY(); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: Could not reopen stdin for interactive mode: %v\n", err)
+				return nil
+			}
+		}
+
 		return generateInteractive(cmd, opts)
 	}
 	return generate(cmd, opts)
+}
+
+func reopenStdinToTTY() error {
+	// Close current stdin
+	os.Stdin.Close()
+	
+	// Reopen stdin to /dev/tty for interactive input
+	tty, err := os.Open("/dev/tty")
+	if err != nil {
+		return fmt.Errorf("could not open /dev/tty: %w", err)
+	}
+	
+	// Replace stdin with tty
+	os.Stdin = tty
+	return nil
 }
 
 func PushHandler(cmd *cobra.Command, args []string) error {
@@ -1509,6 +1566,7 @@ func NewCLI() *cobra.Command {
 	runCmd.Flags().String("think", "", "Enable thinking mode: true/false or high/medium/low for supported models")
 	runCmd.Flags().Lookup("think").NoOptDefVal = "true"
 	runCmd.Flags().Bool("hidethinking", false, "Hide thinking output (if provided)")
+	runCmd.Flags().BoolP("interactive", "i", false, "Enter interactive mode after processing piped input")
 
 	stopCmd := &cobra.Command{
 		Use:     "stop MODEL",
